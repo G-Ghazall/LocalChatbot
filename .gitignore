@@ -1,0 +1,8 @@
+# Private research materials and derived data
+Data/
+storage/
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.env
