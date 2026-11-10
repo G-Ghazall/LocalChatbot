@@ -9,6 +9,11 @@ DEFAULT_SYSTEM_PROMPT = '''You are a careful research assistant. Answer in the u
 SYSTEM_PROMPT_FILE = STORAGE_DIR / 'system_prompt.txt'
 
 st.set_page_config(page_title='Research assistant', page_icon='📚', layout='wide')
+st.markdown('''<style>
+    [data-testid="stBottomBlock"], [data-testid="stBottomBlockContainer"] {
+        padding-bottom: 0.25rem;
+    }
+</style>''', unsafe_allow_html=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 st.title('Research assistant')
 st.caption('Your documents, search index and model run locally on this computer.')
@@ -128,23 +133,35 @@ with st.sidebar:
                 st.session_state.active_chat = chat['id']
                 st.rerun()
         with delete_col:
-            if st.button('?', key=f"delete_{chat['id']}", help=f"Delete {chat['title']}"):
-                remaining = [item for item in st.session_state.chats if item['id'] != chat['id']]
-                try:
-                    save_chats(remaining)
-                except OSError as exc:
-                    st.error(f'Could not delete chat: {exc}')
-                else:
-                    st.session_state.chats = remaining
-                    if st.session_state.active_chat == chat['id']:
-                        st.session_state.active_chat = None
+            if st.button('🗑️', key=f"delete_{chat['id']}", help=f"Delete {chat['title']}"):
+                st.session_state.delete_chat_id = chat['id']
+                st.rerun()
+        if st.session_state.get('delete_chat_id') == chat['id']:
+            st.warning(f"Delete chat ‘{chat['title']}’?")
+            yes_col, no_col = st.columns(2)
+            with no_col:
+                if st.button('No', key=f"cancel_delete_{chat['id']}", use_container_width=True):
+                    st.session_state.delete_chat_id = None
                     st.rerun()
+            with yes_col:
+                if st.button('Yes, delete', key=f"confirm_delete_{chat['id']}", use_container_width=True):
+                    remaining = [item for item in st.session_state.chats if item['id'] != chat['id']]
+                    try:
+                        save_chats(remaining)
+                    except OSError as exc:
+                        st.error(f'Could not delete chat: {exc}')
+                    else:
+                        st.session_state.chats = remaining
+                        st.session_state.delete_chat_id = None
+                        if st.session_state.active_chat == chat['id']:
+                            st.session_state.active_chat = None
+                        st.rerun()
 
 active_chat = next((chat for chat in st.session_state.chats if chat['id'] == st.session_state.active_chat), None)
 history = active_chat['messages'] if active_chat else []
 mode = st.radio('Mode', ['Search documents', 'General chat'], horizontal=True)
 selected = st.multiselect('Documents to search', names, default=names, disabled=mode != 'Search documents')
-with st.expander('System prompt', expanded=True):
+with st.expander('System prompt'):
     st.caption('Define how the assistant should behave. Changes apply to the next answer in either mode. Save the prompt to keep it after restarting the app.')
     if st.button('Restore default prompt'):
         st.session_state.system_prompt = DEFAULT_SYSTEM_PROMPT
