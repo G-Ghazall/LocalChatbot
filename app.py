@@ -3,14 +3,21 @@ import streamlit as st
 from settings import DATA_DIR, STORAGE_DIR, CHAT_MODEL, EMBED_MODEL, SUPPORTED, MAX_FILE_BYTES
 from index_manager import open_store, sync_documents
 from rag import answer
+from chat_history import load_chats, save_chats, new_chat
 
 st.set_page_config(page_title='Research assistant', page_icon='📚', layout='wide')
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 st.title('Research assistant')
 st.caption('Your documents, search index and model run locally on this computer.')
 
-if 'history' not in st.session_state:
-    st.session_state.history = []
+if 'chats' not in st.session_state:
+    try:
+        st.session_state.chats = load_chats()
+    except (OSError, ValueError) as exc:
+        st.error(f'Could not load chat history: {exc}')
+        st.stop()
+if 'active_chat' not in st.session_state:
+    st.session_state.active_chat = None
 if 'sync_needed' not in st.session_state:
     st.session_state.sync_needed = True
 
@@ -98,17 +105,40 @@ with st.sidebar:
             st.rerun()
     st.divider()
     st.caption(f'Chat model: {CHAT_MODEL}  ·  Embeddings: {EMBED_MODEL}')
-    st.caption('Chat is kept in this browser session only. Closing or reloading the session can clear it.')
-    if st.button('Clear conversation', use_container_width=True):
-        st.session_state.history = []
+    st.header('Chat history')
+    if st.button('New chat', use_container_width=True):
+        st.session_state.active_chat = None
         st.rerun()
+    if not st.session_state.chats:
+        st.caption('Your conversations will appear here.')
+    for chat in reversed(st.session_state.chats):
+        name_col, delete_col = st.columns([5, 1])
+        with name_col:
+            if st.button(chat['title'], key=f"open_{chat['id']}", use_container_width=True,
+                         type='primary' if chat['id'] == st.session_state.active_chat else 'secondary'):
+                st.session_state.active_chat = chat['id']
+                st.rerun()
+        with delete_col:
+            if st.button('?', key=f"delete_{chat['id']}", help=f"Delete {chat['title']}"):
+                remaining = [item for item in st.session_state.chats if item['id'] != chat['id']]
+                try:
+                    save_chats(remaining)
+                except OSError as exc:
+                    st.error(f'Could not delete chat: {exc}')
+                else:
+                    st.session_state.chats = remaining
+                    if st.session_state.active_chat == chat['id']:
+                        st.session_state.active_chat = None
+                    st.rerun()
 
+active_chat = next((chat for chat in st.session_state.chats if chat['id'] == st.session_state.active_chat), None)
+history = active_chat['messages'] if active_chat else []
 mode = st.radio('Mode', ['Search documents', 'General chat'], horizontal=True)
 selected = st.multiselect('Documents to search', names, default=names, disabled=mode != 'Search documents')
 with st.expander('Research instructions'):
     instructions = st.text_area('Guide the assistant', value='Distinguish participants’ words from interpretation. Mention uncertainty and differing views.', max_chars=4000)
 st.caption('Answers can contain mistakes. Check cited passages before using them in research.')
-for message in st.session_state.history:
+for message in history:
     with st.chat_message(message['role']):
         st.markdown(message['content'])
         for source in message.get('sources', []):
@@ -121,8 +151,8 @@ if question:
     with st.chat_message('assistant'):
         try:
             with st.spinner('Thinking locally…'):
-                scope = (mode, tuple(sorted(selected)) if mode == 'Search documents' else ())
-                scoped_history = [m for m in st.session_state.history if m.get('scope') == scope]
+                scope = [mode, sorted(selected) if mode == 'Search documents' else []]
+                scoped_history = [m for m in history if m.get('scope') == scope]
                 response, docs = answer(question, scoped_history, instructions, store, selected, mode == 'Search documents')
             st.markdown(response)
             sources = []
@@ -131,7 +161,16 @@ if question:
                 sources.append({'label': label, 'text': doc.page_content})
                 with st.expander(label):
                     st.text(doc.page_content)
-            st.session_state.history.extend([{'role': 'user', 'content': question, 'scope': scope}, {'role': 'assistant', 'content': response, 'sources': sources, 'scope': scope}])
+            updated_chats = [dict(chat, messages=list(chat['messages'])) for chat in st.session_state.chats]
+            updated_chat = next((chat for chat in updated_chats if chat['id'] == st.session_state.active_chat), None)
+            if updated_chat is None:
+                updated_chat = new_chat(question)
+                updated_chats.append(updated_chat)
+            updated_chat['messages'].extend([{'role': 'user', 'content': question, 'scope': scope}, {'role': 'assistant', 'content': response, 'sources': sources, 'scope': scope}])
+            save_chats(updated_chats)
+            st.session_state.chats = updated_chats
+            st.session_state.active_chat = updated_chat['id']
+            st.rerun()
         except Exception as exc:
             st.error(f'Could not answer: {exc}')
             st.info('Check the selected documents and confirm that Ollama and the configured models are available.')
