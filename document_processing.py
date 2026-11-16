@@ -4,6 +4,7 @@ import pymupdf
 from docx import Document as WordDocument
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from settings import CHUNK_SIZE, CHUNK_OVERLAP
 
 
 def digest(path: Path) -> str:
@@ -34,7 +35,7 @@ def load_chunks(path: Path):
                  for location, text in pages if text.strip()]
     if not documents:
         raise ValueError('No text could be extracted. Scanned PDFs require OCR before upload.')
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200, add_start_index=True)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP, add_start_index=True)
     chunks = splitter.split_documents(documents)
     for i, chunk in enumerate(chunks):
         chunk.metadata['passage'] = i + 1
