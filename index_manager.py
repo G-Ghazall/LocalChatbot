@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import logging
+from datetime import datetime, timezone
 os.environ['ANONYMIZED_TELEMETRY'] = 'False'
 os.environ['LANGCHAIN_TRACING_V2'] = 'false'
 os.environ['LANGSMITH_TRACING'] = 'false'
@@ -63,6 +65,10 @@ def sync_documents(store, progress=None):
             chunks = load_chunks(path)
             # Include the content hash so a failed update leaves the previous index intact.
             ids = [hashlib.sha256(f'{name}\0{file_hash}\0{parser_version}\0{i}'.encode()).hexdigest() for i in range(len(chunks))]
+            indexed_at = datetime.now(timezone.utc).isoformat()
+            for chunk, chunk_id in zip(chunks, ids):
+                chunk.metadata.update({'chunk_id': chunk_id, 'document_id': hashlib.sha256(name.encode()).hexdigest(),
+                                       'file_hash': file_hash, 'file_type': path.suffix.lower(), 'indexed_at': indexed_at})
             for start in range(0, len(chunks), 32):
                 report('embedding', start, len(chunks))
                 store.add_documents(chunks[start:start + 32], ids=ids[start:start + 32])
@@ -70,10 +76,12 @@ def sync_documents(store, progress=None):
             old_ids = manifest.get(name, {}).get('ids', [])
             if old_ids:
                 store.delete(ids=old_ids)
-            manifest[name] = {'hash': file_hash, 'ids': ids, 'parser_version': parser_version}
+            manifest[name] = {'hash': file_hash, 'ids': ids, 'parser_version': parser_version,
+                              'size': path.stat().st_size, 'indexed_at': indexed_at, 'chunk_count': len(chunks)}
             messages.append(f'Indexed {name}: {len(chunks)} passages.')
             report('complete')
         except Exception as exc:
+            logging.getLogger(__name__).warning('Indexing failed for %s: %s', name, type(exc).__name__)
             # Never answer from an outdated version when its replacement failed.
             if ids:
                 store.delete(ids=ids)
