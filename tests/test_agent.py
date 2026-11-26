@@ -1,151 +1,183 @@
-import json
-from types import SimpleNamespace
-
 import pytest
 from langchain_core.documents import Document
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
-from agent import CHECK_FAILED, NO_PASSAGES, EvidenceChecker, PlannerResult, Retrieval, build_graph, deduplicate, fallback, parse_json
+import settings
+from agent import ANSWER_TAG, NO_DOCUMENTS, NO_PASSAGES, build_graph, citations, comparison_items, fit, pack, route
 from chat_history import load_chats, save_chats
 
 
-def plan(skill='answer_question', **changes):
-    data = dict(skill=skill, reason='test', rewritten_query='deadline', topics=[], comparison_items=[],
-                document_scope=[], retrieval_queries=[], needs_retrieval=True, needs_clarification=False,
-                clarification_question=None, confidence=0.9)
-    data.update(changes)
-    return json.dumps(data)
-
-
-class Model:
-    def __init__(self, *responses):
-        self.responses = list(responses)
-        self.calls = []
-
-    def invoke(self, messages):
-        self.calls.append(messages)
-        return SimpleNamespace(content=self.responses.pop(0))
+def doc(text, passage, source='a.txt', page=1):
+    return Document(page_content=text, metadata={'source': source, 'passage': passage, 'location': f'page {page}'})
 
 
 class Store:
-    def __init__(self):
+    def __init__(self, docs=None):
+        self.docs = docs if docs is not None else [doc('Deadline is 15 January.', 2), doc('First section.', 1)]
         self.calls = []
-        self.docs = [Document(page_content='Deadline is 15 January.', metadata={'source': 'a.txt', 'passage': 2, 'location': 'document'}),
-                     Document(page_content='First section.', metadata={'source': 'a.txt', 'passage': 1, 'location': 'document'})]
 
     def similarity_search(self, query, k, filter):
-        self.calls.append((query, k, filter))
-        return self.docs[:1]
+        self.calls.append(('similarity', query, k, filter))
+        return self.docs[:k]
+
+    def max_marginal_relevance_search(self, query, k, fetch_k, filter):
+        self.calls.append(('mmr', query, k, filter))
+        return self.docs[:k]
 
     def get(self, where, include):
-        return {'documents': [d.page_content for d in self.docs], 'metadatas': [d.metadata for d in self.docs]}
+        docs = [d for d in self.docs if d.metadata['source'] == where['source']]
+        return {'documents': [d.page_content for d in docs], 'metadatas': [d.metadata for d in docs]}
 
 
-def checker_response():
-    return json.dumps(dict(supported=True, unsupported_claims=[], citation_issues=[], conflicts_found=[], recommended_action='accept', confidence=0.9))
+def model(*responses):
+    return FakeListChatModel(responses=list(responses))
 
 
-def state(**kwargs):
-    result = dict(user_message='What is the deadline?', current_mode='document', selected_document_names=['a.txt'], conversation_context=[], system_prompt='')
-    result.update(kwargs)
-    return result
+def run(store, answers, checker=(), **inputs):
+    state = dict(question='What is the deadline?', mode='document', documents=['a.txt'], history=[], system_prompt='')
+    state.update(inputs)
+    return build_graph(store, model(*answers), model(*checker) if checker else model('{}')).invoke(state)
 
 
-@pytest.mark.parametrize('message,expected', [('What is the deadline?', 'answer_question'), ('Summarize the admission rules', 'summarize_topic'), ('summarize all info about AI in documents', 'summarize_topic'), ('Summarize this document', 'summarize_document'), ('Compare A and B', 'compare_information'), ('Where is the deadline?', 'find_information'), ('Compare the requirements', 'clarify_question')])
-def test_fallback(message, expected):
-    assert fallback(message, 'document', ['a.txt']).skill == expected
+@pytest.mark.parametrize('message,expected', [
+    ('What is the deadline?', 'answer_question'),
+    ('Which AI job profiles were most in demand?', 'answer_question'),
+    ('Summarize the admission rules', 'summarize_topic'),
+    ('summarize all info about AI in documents', 'summarize_topic'),
+    ('Summarize what the reports say about AI', 'summarize_topic'),
+    ('Summarize this document', 'summarize_document'),
+    ('Sammanfatta rapporten', 'summarize_topic'),
+    ('Sammanfatta hela rapporten', 'summarize_document'),
+    ('Compare A and B', 'compare_information'),
+    ('Jämför Sverige och Finland', 'compare_information'),
+    ('Compare the requirements', 'compare_information'),
+    ('Where is the deadline?', 'find_information'),
+    ('Var nämns AI-kompetens?', 'find_information'),
+])
+def test_route(message, expected):
+    assert route(message, 'document', ['a.txt'])[0] == expected
 
 
-def test_general_and_override():
-    assert fallback('hello', 'general', []).skill == 'general_chat'
-    assert fallback('hello', 'document', ['a'], 'find_information').skill == 'find_information'
+def test_route_modes_and_override():
+    assert route('Summarize this document', 'general', [])[0] == 'general_chat'
+    assert route('hello', 'general', [], 'find_information')[0] == 'general_chat'
+    assert route('hello', 'document', [])[0] == 'clarify_question'
+    assert route('hello', 'document', ['a'], 'find_information')[0] == 'find_information'
+    assert comparison_items('Compare Program A and Program B?') == ['Program A', 'Program B']
+    assert comparison_items('What is the difference between Sweden and Finland') == ['Sweden', 'Finland']
 
 
-def test_json_validation():
-    assert parse_json(SimpleNamespace(content='```json\n' + plan() + '\n```'), PlannerResult).skill == 'answer_question'
-    for value in (None, '', ' ', 'invalid', plan(skill='unknown'), '{}', plan(confidence=2)):
-        with pytest.raises(ValueError):
-            parse_json(SimpleNamespace(content=value), PlannerResult)
-    with pytest.raises(ValueError):
-        parse_json(None, PlannerResult)
+def test_citations_and_packing():
+    assert citations('A [1], B [2][3] and C [4, 5].') == {1, 2, 3, 4, 5}
+    assert citations('No refs') == set()
+    docs = [doc('x' * 10, i) for i in range(5)]
+    assert len(fit(docs, 25)) == 2
+    assert len(fit([doc('x' * 100, 1)], 10)) == 1  # always keep at least one passage
+    assert pack([1, 1, 2, 2], 100, size=lambda x: 1, group=lambda x: x) == [[1, 1], [2, 2]]
 
 
-def test_repair_and_fallback():
+def test_answer_with_valid_citation():
     store = Store()
-    planner = Model(None, plan())
-    result = build_graph(store, planner, Model('Deadline: 15 January [1]'), Model(checker_response())).invoke(state())
-    assert result['retry_count'] == 1 and not result['fallback_used']
-    planner = Model(None, 'bad')
-    result = build_graph(store, planner, Model('Deadline: 15 January [1]'), Model(checker_response())).invoke(state())
-    assert result['fallback_used'] and len(planner.calls) == 2
+    result = run(store, ['Deadline is 15 January [1].'])
+    assert result['answer'] == 'Deadline is 15 January [1].'
+    assert result['cited'] == [1] and result['warnings'] == []
+    assert store.calls[0][3] == {'source': 'a.txt'}
 
 
-def test_clarify_and_general_skip_retrieval():
+def test_multiple_documents_use_in_filter():
     store = Store()
-    p = Model(plan('clarify_question', clarification_question='Which program?'))
-    result = build_graph(store, p, Model(), Model()).invoke(state())
-    assert result['final_answer'] == 'Which program?' and not store.calls
-    p = Model(plan('general_chat'))
-    result = build_graph(store, p, Model('Hello!'), Model()).invoke(state(current_mode='general', selected_document_names=[]))
-    assert result['final_answer'] == 'Hello!' and not store.calls
+    run(store, ['Answer [1].'], documents=['a.txt', 'b.txt'])
+    assert store.calls[0][3] == {'source': {'$in': ['a.txt', 'b.txt']}}
 
 
-def test_real_graph_citation_and_filter():
+def test_bad_citations_are_flagged_not_hidden():
+    result = run(Store(), ['Invented [9].'])
+    assert result['answer'] == 'Invented [9].'
+    assert any('[9]' in w for w in result['warnings'])
+    result = run(Store(), ['No citations here.'])
+    assert result['answer'] == 'No citations here.'
+    assert any('no valid source citations' in w for w in result['warnings'])
+
+
+def test_no_passages():
+    result = run(Store([]), ['unused'])
+    assert result['answer'] == NO_PASSAGES and result['sources'] == []
+
+
+def test_no_documents_selected_asks_for_selection():
     store = Store()
-    result = build_graph(store, Model(plan()), Model('Deadline is 15 January [1].'), Model(checker_response())).invoke(state())
-    assert result['final_answer'] == 'Deadline is 15 January [1].'
-    assert store.calls[0][2] == {'source': 'a.txt'}
-    result = build_graph(store, Model(plan()), Model('Invented [9].', 'Still invented [9].'), Model()).invoke(state())
-    assert 'valid source references' in result['final_answer']
-    assert 'Still invented' not in result['final_answer']
-    assert 'Deadline is 15 January.' in result['final_answer']
+    result = run(store, [], documents=[])
+    assert result['answer'] == NO_DOCUMENTS and not store.calls
 
 
-def test_missing_citation_is_repaired_and_checked():
+def test_general_chat_skips_retrieval():
     store = Store()
-    answer = Model('Deadline is 15 January.', 'Deadline is 15 January [1].')
-    result = build_graph(store, Model(plan()), answer, Model(checker_response())).invoke(state())
-    assert len(answer.calls) == 2
-    assert result['final_answer'] == 'Deadline is 15 January [1].'
+    result = run(store, ['Hello!'], mode='general', documents=[], task='answer_question')
+    assert result['answer'] == 'Hello!' and not store.calls and result['skill'] == 'general_chat'
 
 
-def test_retrieval_order_and_deduplication():
+def test_follow_up_is_rewritten_for_search():
     store = Store()
-    assert [d.metadata['passage'] for d in Retrieval(store).whole(['a.txt'])] == [1, 2]
-    assert len(deduplicate(store.docs + store.docs)) == 2
+    history = [{'role': 'user', 'content': 'Tell me about program A'}, {'role': 'assistant', 'content': 'It is ...'}]
+    result = run(store, ['Program A deadline', 'Deadline is 15 January [1].'], history=history)
+    assert store.calls[0][1] == 'Program A deadline'
+    assert result['answer'] == 'Deadline is 15 January [1].'
 
 
-def test_checker_rejects_unsupported_claim():
-    result = dict(supported=False, unsupported_claims=['claim'], citation_issues=[], conflicts_found=[], recommended_action='revise', confidence=0.8)
-    checked = EvidenceChecker(Model(json.dumps(result))).check({'retrieved_chunks': Store().docs, 'draft_answer': 'A claim [1].'})
-    assert 'could not verify' in checked['final_answer']
-    assert 'A claim' not in checked['final_answer']
+def test_topic_summary_uses_diverse_search():
+    store = Store()
+    run(store, ['Summary [1].'], question='Summarize the admission rules')
+    assert store.calls[0][0] == 'mmr'
 
 
-def test_checker_invalid_response_is_not_reported_as_missing_evidence():
-    checked = EvidenceChecker(Model('not json')).check({'retrieved_chunks': Store().docs, 'draft_answer': 'A claim [1].'})
-    assert checked['final_answer'].startswith(CHECK_FAILED)
-    assert checked['evidence_check_result']['recommended_action'] == 'check_failed'
+def test_compare_searches_each_item():
+    store = Store()
+    result = run(store, ['A [1] vs B [2].'], question='Compare program A and program B')
+    assert [c[1] for c in store.calls] == ['Compare program A and program B program A',
+                                           'Compare program A and program B program B']
+    assert result['items'] == ['program A', 'program B']
 
 
-def test_no_passages_is_distinct():
-    checked = EvidenceChecker(Model()).check({'retrieved_chunks': [], 'draft_answer': 'No evidence'})
-    assert checked['final_answer'] == NO_PASSAGES
+def test_whole_document_summary_map_reduce(monkeypatch):
+    monkeypatch.setattr(settings, 'MAX_CONTEXT', 30)
+    store = Store([doc('First part text.', 1), doc('Second part text.', 2), doc('Third part text.', 3)])
+    result = run(store, ['note 1 [1]', 'note 2 [2]', 'note 3 [3]', 'Summary [1][3].'], question='Summarize this document')
+    assert result['skill'] == 'summarize_document'
+    assert result['answer'] == 'Summary [1][3].' and result['cited'] == [1, 3]
+    assert [d.metadata['passage'] for d in result['sources']] == [1, 2, 3]
 
 
-def test_revision_is_checked_before_returning():
-    rejected = json.dumps(dict(supported=False, unsupported_claims=['wrong'], citation_issues=[], conflicts_found=[], recommended_action='revise', confidence=0.8))
-    class Generator:
-        def generate(self, *args):
-            return 'Deadline is 15 January [1].'
-    checked = EvidenceChecker(Model(rejected, checker_response()), Generator()).check(
-        {'retrieved_chunks': Store().docs, 'draft_answer': 'Wrong [1].', 'user_message': 'What is the deadline?'})
-    assert checked['final_answer'] == 'Deadline is 15 January [1].'
+def test_too_large_document_falls_back_to_topic_summary(monkeypatch):
+    monkeypatch.setattr(settings, 'MAX_CONTEXT', 10)
+    monkeypatch.setattr(settings, 'MAX_SUMMARY_PARTS', 1)
+    store = Store([doc('First part text.', 1), doc('Second part text.', 2)])
+    result = run(store, ['Summary [1].'], question='Summarize this document')
+    assert result['answer'] == 'Summary [1].' and 'too long' in result['warnings'][0]
 
 
-def test_history_old_and_new(tmp_path, monkeypatch):
+def test_verify_adds_warning_but_keeps_answer():
+    rejected = '{"supported": false, "unsupported_claims": ["Deadline is 1 Feb"]}'
+    result = run(Store(), ['Deadline is 1 Feb [1].'], checker=[rejected], verify=True)
+    assert result['answer'] == 'Deadline is 1 Feb [1].'
+    assert any('Deadline is 1 Feb' in w for w in result['warnings'])
+    result = run(Store(), ['Deadline is 15 January [1].'], checker=['{"supported": true}'], verify=True)
+    assert result['warnings'] == []
+    result = run(Store(), ['Deadline [1].'], checker=['not json'], verify=True)
+    assert any('could not be completed' in w for w in result['warnings'])
+
+
+def test_answer_tokens_are_streamed():
+    graph = build_graph(Store(), model('Deadline is 15 January [1].'), model('{}'))
+    state = dict(question='What is the deadline?', mode='document', documents=['a.txt'], history=[])
+    tokens = [chunk.content for chunk, meta in graph.stream(state, stream_mode='messages')
+              if ANSWER_TAG in meta.get('tags', [])]
+    assert ''.join(tokens) == 'Deadline is 15 January [1].'
+
+
+def test_history_round_trip(tmp_path, monkeypatch):
     import chat_history
     monkeypatch.setattr(chat_history, 'STORAGE_DIR', tmp_path)
     monkeypatch.setattr(chat_history, 'HISTORY_FILE', tmp_path / 'chats.json')
-    chats = [{'id': '1', 'messages': [{'role': 'assistant', 'content': 'old'}, {'role': 'assistant', 'content': 'new', 'skill': 'general_chat'}]}]
+    chats = [{'id': '1', 'title': 't', 'messages': [{'role': 'assistant', 'content': 'old'}]}]
     save_chats(chats)
     assert load_chats() == chats
